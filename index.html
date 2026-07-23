@@ -337,6 +337,15 @@ body{
 .file-row .fic{font-size:16px}
 .file-row .fname{flex:1;font-family:'JetBrains Mono';font-size:12px;color:var(--text)}
 .file-row .fok{font-size:11px;color:var(--green);font-weight:700}
+.file-row .fchip{font-family:'JetBrains Mono';font-size:11px;letter-spacing:.02em;border:1px solid var(--line);border-radius:999px;padding:2px 10px;background:transparent;color:var(--muted);cursor:pointer;transition:.15s}
+.file-row .fchip:hover{border-color:var(--cyan);color:var(--text)}
+.file-row .fchip.usd{color:var(--amber);border-color:var(--amber)}
+.file-row .fx-x{background:transparent;border:none;color:var(--muted-2);font-size:16px;line-height:1;cursor:pointer;padding:0 2px;transition:.15s}
+.file-row .fx-x:hover{color:var(--red)}
+.fx-rate-row{margin-top:12px;text-align:left;font-size:12.5px;color:var(--muted);line-height:1.55}
+.fx-rate-row #fxRate{width:88px;background:var(--card);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:4px 8px;font-family:'JetBrains Mono';font-size:12px;margin:0 4px}
+.fx-rate-row .fx-hint{display:block;color:var(--muted-2);font-size:11.5px;margin-top:5px}
+.fx-msg{margin-top:10px;text-align:left;color:var(--amber);font-weight:700;font-size:12.5px}
 .dropspot{display:flex;flex-direction:column;align-items:center;gap:3px;margin-top:14px;padding:22px;border:2px dashed var(--line);border-radius:14px;cursor:pointer;transition:.15s}
 .dropspot:hover,.dropspot.over{border-color:var(--cyan);background:color-mix(in srgb,var(--cyan) 6%,transparent)}
 .dropspot .drop-plus{font-size:26px;color:var(--cyan-soft);line-height:1;font-weight:400}
@@ -644,6 +653,11 @@ body.in .reveal{opacity:1;transform:none;transition:opacity .55s cubic-bezier(.2
     <h2 class="modal-title">Add your bank statement</h2>
     <p class="modal-sub">Drop in a CSV or OFX/QFX export from your bank. Add <b>every</b> account your money moves through — another card, a second chequing, Stripe / PayPal — so no money is missed. It runs in your browser; nothing is uploaded.</p>
     <div class="file-list" id="fileList"></div>
+    <div class="fx-rate-row" id="fxRateRow" style="display:none">USD gets reported in CAD. If these statements hold a real conversion the rate is read from it; otherwise enter your bank's rate:
+      <input id="fxRate" type="number" step="0.0001" min="1" max="2" placeholder="1.37">
+      <span class="fx-hint">CRA files in CAD; confirm the rate treatment with your accountant.</span>
+    </div>
+    <div class="fx-msg" id="fxMsg" style="display:none"></div>
     <label class="dropspot" id="dropspot" for="moreFiles">
       <input type="file" id="moreFiles" accept=".csv,.ofx,.qfx" multiple hidden>
       <span class="drop-plus">＋</span>
@@ -735,7 +749,7 @@ function parseCSVText(text){
   if(field!=='' || row.length>0){ row.push(field); rows.push(row); }
   return rows;
 }
-function loadCSV(text){
+function loadCSV(text, currency){
   var raw=parseCSVText(text), txns=[], quarantine=[];
   if(!raw.length) return {txns:txns, quarantine:quarantine};
   var hdr=findHeader(raw);
@@ -755,14 +769,14 @@ function loadCSV(text){
       else { var deb=parseMoney(get('debit')), cred=parseMoney(get('credit'));
              amt=(deb===null && cred===null)? null : (cred||0)-Math.abs(deb||0); }
       if(amt===null){ quarantine.push({line:r+1, raw:cells.join(','), reason:'unparseable amount'}); continue; }
-      txns.push({date:date, desc:desc||'(no description)', amt:amt, acct:acct});
+      txns.push({date:date, desc:desc||'(no description)', amt:amt, acct:acct, cur:currency});
     }catch(e){ quarantine.push({line:r+1, raw:cells.join(','), reason:'row error'}); }
   }
   return {txns:txns, quarantine:quarantine};
 }
 function looksLikeOFX(text){ return /<OFX>|<STMTTRN>|OFXHEADER/i.test(text); }
 function ofxField(block, tag){ var m=block.match(new RegExp('<'+tag+'>([^<\\r\\n]*)','i')); return m? m[1].trim() : ''; }
-function loadOFX(text){
+function loadOFX(text, currency){
   var txns=[], quarantine=[];
   var blocks=text.match(/<STMTTRN>[\s\S]*?<\/STMTTRN>/gi);
   if(!blocks){ var parts=text.split(/<STMTTRN>/i); blocks = parts.length>1 ? parts.slice(1) : []; }
@@ -774,7 +788,7 @@ function loadOFX(text){
     var dt=ofxField(b,'DTPOSTED');
     var date = dt.length>=8 ? (dt.slice(0,4)+'-'+dt.slice(4,6)+'-'+dt.slice(6,8)) : '';
     if(amt===null){ quarantine.push({line:i+1, raw:b.slice(0,60), reason:'unparseable OFX txn'}); continue; }
-    txns.push({date:date, desc:name||'(no description)', amt:amt, acct:''});
+    txns.push({date:date, desc:name||'(no description)', amt:amt, acct:'', cur:currency});
   }
   return {txns:txns, quarantine:quarantine};
 }
@@ -805,12 +819,88 @@ function anyIn(desc, pats){ var d=desc.toLowerCase(); for(var i=0;i<pats.length;
 function isOwnerDraw(d){ return anyIn(d, OWNER_DRAW_PATTERNS); }
 function isReserveTransfer(d){ return anyIn(d, RESERVE_TRANSFER_PATTERNS); }
 function isTaxReserve(d){ return anyIn(d, TAX_RESERVE_PATTERNS); }
-function analyze(txns){
+/* ===== CURRENCY (stage 3.5): USD+CAD — pair conversion legs, report in CAD (Alex's engine, verbatim) =====
+   Two accounts, two currencies: a conversion has two legs of different amounts (US$5,000 out, C$6,800 in a
+   few days later). Match them by date + a sane implied rate; count the revenue ONCE; report in CAD because
+   CRA files in CAD. With no rate to read and none entered, the run STOPS and asks — never guesses. */
+var FX_BAND_LO=1.10, FX_BAND_HI=1.70, FX_DAYS=4;
+var CONVERSION_HINTS=['convert','conversion','foreign exchange','fx transfer','usd','us dollar','cross border','cross-border'];
+function looksLikeConversion(d){ return anyIn(d, CONVERSION_HINTS); }
+function parseDateAny(s){ if(!s) return null; var t=Date.parse(String(s).trim()); return isNaN(t)? null : t; }
+function pairConversions(txns){
+  var pairs=[], hasUSD=false, hasCAD=false, i;
+  for(i=0;i<txns.length;i++){ if((txns[i].cur||'CAD')==='USD') hasUSD=true; else hasCAD=true; }
+  if(!hasUSD || !hasCAD) return pairs;
+  function legs(cur,wantNeg){ var out=[]; for(var k=0;k<txns.length;k++){ var t=txns[k];
+      if((t.cur||'CAD')!==cur) continue;
+      if(wantNeg? t.amt>=0 : t.amt<=0) continue;
+      if(isOwnerDraw(t.desc)||isReserveTransfer(t.desc)) continue;
+      out.push(t); } return out; }
+  function match(outLegs,inLegs,outCur){
+    for(var a=0;a<outLegs.length;a++){ var o=outLegs[a]; if(o._fx) continue;
+      var od=parseDateAny(o.date), best=null, bestD=1e9, bestR=1e9;
+      for(var b=0;b<inLegs.length;b++){ var n=inLegs[b]; if(n._fx) continue;
+        var usd = outCur==='USD'? Math.abs(o.amt) : n.amt;
+        var cad = outCur==='USD'? n.amt : Math.abs(o.amt);
+        if(usd<=0) continue;
+        var rate=cad/usd;
+        if(rate<FX_BAND_LO||rate>FX_BAND_HI) continue;
+        var nd=parseDateAny(n.date), delta=FX_DAYS;
+        if(od!==null&&nd!==null){ delta=Math.abs(nd-od)/86400000; if(delta>FX_DAYS) continue; }
+        var rd=Math.abs(rate-1.38);
+        if(delta<bestD || (delta===bestD && rd<bestR)){ best=n; bestD=delta; bestR=rd; }
+      }
+      if(best){ o._fx=true; best._fx=true;
+        var usd2 = outCur==='USD'? Math.abs(o.amt) : best.amt;
+        var cad2 = outCur==='USD'? best.amt : Math.abs(o.amt);
+        pairs.push({usd:Math.round(usd2*100)/100, cad:Math.round(cad2*100)/100,
+                    rate:Math.round(cad2/usd2*10000)/10000, desc:o.desc, date:o.date});
+      }
+    }
+  }
+  match(legs('USD',true), legs('CAD',false), 'USD');   /* the normal direction */
+  match(legs('CAD',true), legs('USD',false), 'CAD');   /* funding the USD account */
+  return pairs;
+}
+/* excluded from the coach's "unusual expense" learning: owner draws, parked transfers, review items, conversion legs (cat Reserve/Tax reserve) */
+function _coachSkip(x){ return x.note==='owner draw' || x.note==='parked, not counted' || x.cat==='Uncategorized/Review' || x.cat==='Reserve' || x.cat==='Tax reserve'; }
+function analyze(txns, usdRate){
+  /* CURRENCY (stage 3.5): pair conversion legs, pick the CAD reporting rate */
+  var fxPairs=pairConversions(txns), hasUSD=false;
+  for(var hi=0;hi<txns.length;hi++){ if((txns[hi].cur||'CAD')==='USD'){ hasUSD=true; break; } }
+  var realized=null; if(fxPairs.length){ var rs=0; fxPairs.forEach(function(p){rs+=p.rate;}); realized=Math.round(rs/fxPairs.length*10000)/10000; }
+  var rateUsed=null, rateSource=null;
+  if(hasUSD){
+    if(usdRate){ rateUsed=usdRate; rateSource='the rate you entered'; }
+    else if(realized){ rateUsed=realized; rateSource='read from your own conversion'; }
+    else return {needRate:true};
+  }
   var revenue=0, spend={}, review=[], bizOnPersonal=[], duplicates=[], toolsFound={},
       taxSetAside=0, transfersExcluded=[], ownerDraws=[], commingling=[], transactions=[], dates=[], seen={};
   for(var i=0;i<txns.length;i++){
-    var t=txns[i], desc=t.desc, amt=t.amt, acct=t.acct||'';
+    var t=txns[i], desc=t.desc, amt=t.amt, acct=t.acct||'', cur=t.cur||'CAD';
     if(t.date) dates.push(t.date);
+    /* a matched conversion leg = the same money crossing currencies: exclude BOTH legs */
+    if(t._fx){
+      var native=(cur==='USD'?'US$':'C$')+fmt(Math.abs(t.amt));
+      var cadV=Math.abs(t.amt)*(cur==='USD'?rateUsed:1);
+      transfersExcluded.push({desc:desc, amt:Math.round(cadV)});
+      transactions.push({date:t.date, desc:desc, amt:-Math.round(cadV), cat:'Reserve', note:'conversion leg ('+native+'), revenue counted once'});
+      continue;
+    }
+    var fxNote='';
+    if(cur==='USD'){
+      /* conversion-looking USD outflow with no matched CAD deposit: a statement is missing — review, never guess */
+      if(amt<0 && looksLikeConversion(desc)){
+        var cv=Math.abs(amt)*rateUsed;
+        spend['Uncategorized/Review']=(spend['Uncategorized/Review']||0)+cv;
+        review.push({desc:'[USD] '+desc, amt:Math.round(cv)});
+        transactions.push({date:t.date, desc:desc, amt:-Math.round(cv), cat:'Uncategorized/Review', note:'US$'+fmt(Math.abs(amt))+' conversion-like, no matching CAD deposit'});
+        continue;
+      }
+      fxNote='US$'+fmt(Math.abs(amt))+' @ '+rateUsed;
+      amt=amt*rateUsed; /* report in CAD from here on */
+    }
     if(isOwnerDraw(desc)){
       var draw=Math.abs(amt);
       spend["Owner's Pay"]=(spend["Owner's Pay"]||0)+draw;
@@ -824,12 +914,12 @@ function analyze(txns){
       transactions.push({date:t.date, desc:desc, amt:-Math.round(Math.abs(amt)), cat:isTaxReserve(desc)?'Tax reserve':'Reserve', note:'parked, not counted'});
       continue;
     }
-    if(amt>0){ revenue+=amt; transactions.push({date:t.date, desc:desc, amt:Math.round(amt), cat:'Income', note:''}); continue; }
+    if(amt>0){ revenue+=amt; transactions.push({date:t.date, desc:desc, amt:Math.round(amt), cat:'Income', note:fxNote}); continue; }
     var out=Math.abs(amt);
     var cat=categorize(desc);
     if(cat===null){ cat='Uncategorized/Review'; review.push({desc:desc, amt:Math.round(out)}); }
     spend[cat]=(spend[cat]||0)+out;
-    var note = (cat==="Owner's Pay")?'commingling':((acct.toLowerCase()==='personal' && (cat==='Operating Expenses'||cat==='Marketing'))?'on personal card':'');
+    var note = (cat==="Owner's Pay")?'commingling':((acct.toLowerCase()==='personal' && (cat==='Operating Expenses'||cat==='Marketing'))?'on personal card':fxNote);
     transactions.push({date:t.date, desc:desc, amt:-Math.round(out), cat:cat, note:note});
     if(cat==="Owner's Pay") commingling.push({desc:desc, amt:Math.round(out)});
     if(acct.toLowerCase()==='personal' && (cat==='Operating Expenses'||cat==='Marketing')) bizOnPersonal.push({desc:desc, amt:Math.round(out), cat:cat});
@@ -856,13 +946,13 @@ function analyze(txns){
   if(tkeys.length>=2){ var sum=0; tkeys.forEach(function(k){sum+=toolsFound[k];}); overlap={tools:tkeys.sort(), monthly:Math.round(sum), yearly:Math.round(sum*12)}; }
   var period=null; if(dates.length){ dates.sort(); period={start:dates[0], end:dates[dates.length-1]}; }
   var biggest = spend_breakdown.length? spend_breakdown[0].cat : null;
-  var expAmts=[]; for(var ti=0;ti<transactions.length;ti++){ var tt=transactions[ti]; if(tt.amt<0 && tt.note!=='owner draw' && tt.note!=='parked, not counted' && tt.cat!=='Uncategorized/Review') expAmts.push(Math.abs(tt.amt)); }
+  var expAmts=[]; for(var ti=0;ti<transactions.length;ti++){ var tt=transactions[ti]; if(tt.amt<0 && !_coachSkip(tt)) expAmts.push(Math.abs(tt.amt)); }
   var unusual=[];
   if(expAmts.length>=5){
     var sortedE=expAmts.slice().sort(function(a,b){return a-b;});
     var medE=sortedE[Math.floor(sortedE.length/2)];
     for(var tj=0;tj<transactions.length;tj++){ var t2=transactions[tj];
-      if(t2.amt<0 && t2.note!=='owner draw' && t2.note!=='parked, not counted' && t2.cat!=='Uncategorized/Review'){
+      if(t2.amt<0 && !_coachSkip(t2)){
         var av=Math.abs(t2.amt);
         if(av>=Math.max(medE*4,1500)) unusual.push({desc:t2.desc, amt:av, cat:t2.cat});
       }
@@ -872,14 +962,15 @@ function analyze(txns){
   return {real_revenue:Math.round(revenue), total_out:Math.round(total_out), profit:Math.round(profit), tax_set_aside:Math.round(taxSetAside),
     allocations:alloc, spend_breakdown:spend_breakdown, biggest_expense:biggest, biz_on_personal:bizOnPersonal, owner_draws:ownerDraws,
     commingling:commingling, transactions:transactions, review_queue:review, duplicates:duplicates, overlap:overlap, unusual:unusual,
-    transfers_excluded:transfersExcluded, period:period, txn_count:txns.length, quarantined:[]};
+    transfers_excluded:transfersExcluded, period:period, txn_count:txns.length, quarantined:[],
+    fx:(hasUSD? {rate_used:rateUsed, rate_source:rateSource, pairs:fxPairs} : null)};
 }
 var ICON={"Owner's Pay":"💸","Operating Expenses":"🧾","Marketing":"📣","Taxes":"🏛️","Profit":"🛡️","Income":"📥"};
 var SUB={"Owner's Pay":"what you take home","Operating Expenses":"cost to run","Marketing":"growth spend","Taxes":"CRA reserve","Profit":"kept in the business"};
 function priceCreep(r){
   var out=[], cur={};
   r.transactions.forEach(function(t){
-    if(t.amt<0 && t.note!=='owner draw' && t.note!=='parked, not counted' && t.cat!=='Uncategorized/Review'){
+    if(t.amt<0 && !_coachSkip(t)){
       var k=String(t.desc).toLowerCase().trim(), a=Math.abs(t.amt);
       if(!cur[k] || a>cur[k]) cur[k]=a;
     }
@@ -900,7 +991,7 @@ function priceCreep(r){
 function buildLedgerCSV(r){
   function q(v){ v=String(v); return /[",\n]/.test(v)? '"'+v.replace(/"/g,'""')+'"' : v; }
   var lines=[["Date","Description","Category","Amount","Flag"].map(q).join(",")];
-  function flagFor(t){ if(t.cat==='Uncategorized/Review') return 'review'; if(t.note==='commingling') return 'commingling - move to personal'; if(t.note==='parked, not counted') return 'internal transfer excluded'; if(t.note==='on personal card') return 'business charge on personal card'; return ''; }
+  function flagFor(t){ if(t.cat==='Uncategorized/Review') return 'review'; if(t.note==='commingling') return 'commingling - move to personal'; if(t.note && t.note.indexOf('conversion leg')===0) return 'internal transfer excluded'; if(t.note==='parked, not counted') return 'internal transfer excluded'; if(t.note==='on personal card') return 'business charge on personal card'; return ''; }
   var txns=r.transactions.slice().sort(function(a,b){var A=a.date||'',B=b.date||''; return A<B?-1:A>B?1:0;});
   txns.forEach(function(t){ lines.push([t.date,t.desc,t.cat,t.amt,flagFor(t)].map(q).join(",")); });
   var drawTot=0; (r.owner_draws||[]).forEach(function(d){drawTot+=d.amt;});
@@ -1091,6 +1182,12 @@ function saveHeroSection(r){
     + '<button class="save-cta" onclick="var e=document.getElementById(\'leaks\');if(e)e.scrollIntoView({behavior:\'smooth\',block:\'center\'});">Show me where →</button></section>';
 }
 function dismissSavings(){ try{ sessionStorage.setItem('mh_savings_dismissed','1'); }catch(e){} var el=document.querySelector('.save-hero'); if(el){ el.style.transition='opacity .25s ease, transform .25s ease'; el.style.opacity='0'; el.style.transform='translateY(-8px)'; setTimeout(function(){ if(el&&el.parentNode) el.parentNode.removeChild(el); },240); } }
+/* FX — 2 currencies, 1 set of books (only shown when USD statements are present) */
+function fxSection(r){
+  if(!(r.fx && r.fx.rate_used)) return '';
+  var pr=''; for(var i=0;i<r.fx.pairs.length;i++){ var p=r.fx.pairs[i]; pr+=' &middot; conversion counted once: US$'+fmt(p.usd)+' &rarr; C$'+fmt(p.cad); }
+  return '<section class="banner good reveal" style="margin-bottom:18px"><b>2 currencies, 1 set of books.</b> USD reported in CAD at '+r.fx.rate_used+' ('+esc(r.fx.rate_source)+')'+pr+'. CRA files in CAD; confirm the rate treatment with your accountant.</section>';
+}
 function leaksSection(r){
   var rows='';
   if(r.overlap) rows+='<div class="drag"><div class="info"><b>🔁 '+r.overlap.tools.length+' overlapping tools</b><span>'+r.overlap.tools.map(cap).join(', ')+'</span></div><div class="cost"><b>$'+fmt(r.overlap.monthly)+'/mo</b><span>$'+fmt(r.overlap.yearly)+'/yr</span></div></div>';
@@ -1100,7 +1197,9 @@ function leaksSection(r){
 }
 function eyesSection(r){
   var rows='';
-  r.review_queue.forEach(function(x,i){ rows+='<div class="eye"><div><div class="em">❓ '+esc(x.desc)+'</div><div class="eq">counted in Total out · needs a bucket</div></div><div class="er"><span class="amt num">$'+fmt(x.amt)+'</span><span><button class="gbtn yes" onclick="fileEyeIdx('+i+',\'biz\')">Business</button><button class="gbtn" onclick="fileEyeIdx('+i+',\'personal\')">Personal</button></span></div></div>'; });
+  r.review_queue.forEach(function(x,i){
+    if(String(x.desc).indexOf('[USD] ')===0){ rows+='<div class="eye"><div><div class="em">🌐 '+esc(x.desc)+'</div><div class="eq">conversion-like, no matching CAD deposit — add the missing statement and re-run</div></div><div class="er"><span class="amt num">$'+fmt(x.amt)+'</span></div></div>'; return; }
+    rows+='<div class="eye"><div><div class="em">❓ '+esc(x.desc)+'</div><div class="eq">counted in Total out · needs a bucket</div></div><div class="er"><span class="amt num">$'+fmt(x.amt)+'</span><span><button class="gbtn yes" onclick="fileEyeIdx('+i+',\'biz\')">Business</button><button class="gbtn" onclick="fileEyeIdx('+i+',\'personal\')">Personal</button></span></div></div>'; });
   if(r.quarantined && r.quarantined.length) rows+='<div class="eye"><div><div class="em">⚠️ '+r.quarantined.length+' row(s) quarantined</div><div class="eq">unparseable — skipped, not counted</div></div><div class="er"><span class="amt num">—</span></div></div>';
   if(!rows) rows='<p style="color:var(--muted);font-size:13px">Everything parsed and categorized cleanly. ✓</p>';
   return '<section class="card reveal" style="margin-bottom:18px"><div class="card-h"><h3>Needs your eyes</h3><span class="hint">never guessed</span></div><div class="teach">Anything unclear is set aside for you to confirm, never guessed into the wrong place.</div>'+rows+'</section>';
@@ -1167,6 +1266,7 @@ function buildDashboard(r,isDemo){
   var rev=r.real_revenue;
   return '<div class="topbar"><div class="topbar-left"><h1>Dashboard</h1><div class="date" id="periodLine">'+periodText(r)+'</div></div></div>'
     + saveHeroSection(r)
+    + fxSection(r)
     + '<section class="hero reveal">'+heroCard(r,isDemo)+ytdCard(r,isDemo)+'</section>'
     + kpiSection(r)
     + moveSection(r)
@@ -1250,7 +1350,7 @@ function loadSample(){ var res=loadCSV(SAMPLE_CSV); var r=analyze(res.txns); r.q
 
 /* ===== Stage 3 — classify uncategorized charges + change past decisions ===== */
 function persistFiled(){ if(window.IS_DEMO) return; try{ localStorage.setItem('mh_filed',JSON.stringify(USER_FILED)); }catch(e){} }
-function reanalyzeCurrent(){ if(CURRENT_TXNS&&CURRENT_TXNS.length){ var r=analyze(CURRENT_TXNS); r.quarantined=(CURRENT&&CURRENT.quarantined)||[]; if(!window.IS_DEMO) updateYTD(r); render(r,window.IS_DEMO,CURRENT_TXNS); } }
+function reanalyzeCurrent(){ if(CURRENT_TXNS&&CURRENT_TXNS.length){ CURRENT_TXNS.forEach(function(t){ t._fx=false; }); var r=analyze(CURRENT_TXNS, USER_RATE); if(r&&r.needRate) return; r.quarantined=(CURRENT&&CURRENT.quarantined)||[]; if(!window.IS_DEMO) updateYTD(r); render(r,window.IS_DEMO,CURRENT_TXNS); } }
 function catFor(kind){ return kind==='biz'?'Operating Expenses':"Owner's Pay"; }
 function fileEyeIdx(i,kind){
   if(!CURRENT||!CURRENT.review_queue||!CURRENT.review_queue[i]) return;
@@ -1271,32 +1371,86 @@ function classificationsSection(r){
   return '<section class="card reveal" style="margin-bottom:18px"><div class="card-h"><h3>Your classifications</h3><span class="hint">change any you misclicked</span></div><div class="teach">Charges you\'ve sorted. Change one anytime — the spending totals and your bookkeeping numbers update instantly, and it\'s remembered for next time.</div>'+rows+'</section>';
 }
 
-/* ===== file intake ===== */
-var pendingFiles=[];
-function modalAddFiles(files){ for(var i=0;i<files.length;i++){ pendingFiles.push(files[i]); var row=document.createElement('div'); row.className='file-row'; row.innerHTML='<span class="fic">📎</span><span class="fname">'+esc(files[i].name)+'</span><span class="fok">Added ✓</span>'; var L=document.getElementById('fileList'); if(L) L.appendChild(row); } }
-function readFiles(list, cb){ var out=[], n=list.length, done=0; if(!n){cb([]);return;} for(var i=0;i<n;i++){ (function(f){ var rd=new FileReader(); rd.onload=function(e){ out.push({name:f.name,text:e.target.result}); if(++done===n) cb(out); }; rd.onerror=function(){ if(++done===n) cb(out); }; rd.readAsText(f); })(list[i]); } }
-function processTexts(list){
-  var txns=[], qu=[];
-  for(var i=0;i<list.length;i++){ var f=list[i], lower=(f.name||'').toLowerCase();
-    if(lower.slice(-4)==='.pdf' || f.text.slice(0,5)==='%PDF-'){ alert('PDFs aren\'t supported yet — please export a CSV or OFX from your bank.'); continue; }
-    var res=(lower.slice(-4)==='.ofx'||lower.slice(-4)==='.qfx'||looksLikeOFX(f.text)) ? loadOFX(f.text) : loadCSV(f.text);
-    txns=txns.concat(res.txns); qu=qu.concat(res.quarantine);
-  }
-  if(!txns.length){ alert("Couldn't find any transactions in that file. Make sure it's a CSV or OFX export from your bank."); return; }
-  var r=analyze(txns); r.quarantined=qu;
-  window.IS_DEMO=false;
-  try{ localStorage.setItem('mh_last_txns', JSON.stringify(txns)); }catch(e){}
-  updateYTD(r);
-  render(r,false,txns);
+/* ===== file intake (currency-aware statement basket — Alex's basket logic, in the v2 modal) ===== */
+var pendingFiles=[];   /* {name, txns, quarantine, cur} — parsed at add time */
+var pendingReads=0;    /* FileReaders still in flight, so Continue can wait them out */
+var USER_RATE=null;    /* only ever holds a rate the user TYPED (null => realized rate recomputes) */
+function detectCur(name, text){
+  if(looksLikeOFX(text)){ var cd=ofxField(text,'CURDEF'); if(/USD/i.test(cd)) return 'USD'; if(/CAD/i.test(cd)) return 'CAD'; }
+  if(/usd|u\.s\./i.test(name||'')) return 'USD';
+  return 'CAD';
 }
+function modalAddFiles(files){
+  for(var i=0;i<files.length;i++){ (function(f){
+    pendingReads++;
+    var rd=new FileReader();
+    rd.onload=function(e){ pendingReads--; addParsedFile(f.name, e.target.result); };
+    rd.onerror=function(){ pendingReads--; };
+    rd.readAsText(f);
+  })(files[i]); }
+}
+function addParsedFile(name, text){
+  var lower=(name||'').toLowerCase();
+  if(lower.slice(-4)==='.pdf' || text.slice(0,5)==='%PDF-'){ alert('PDFs aren\'t supported yet — please export a CSV or OFX from your bank.'); return; }
+  var cur=detectCur(name,text);
+  var res=(lower.slice(-4)==='.ofx'||lower.slice(-4)==='.qfx'||looksLikeOFX(text)) ? loadOFX(text,cur) : loadCSV(text,cur);
+  if(!res.txns.length){ alert("Couldn't find any transactions in "+(name||'that file')+". Make sure it's a CSV or OFX export from your bank."); return; }
+  pendingFiles.push({name:name||'statement', txns:res.txns, quarantine:res.quarantine, cur:cur});
+  renderFileRows();
+}
+function renderFileRows(){
+  var L=document.getElementById('fileList'); if(!L) return;
+  var h='', anyUSD=false;
+  for(var i=0;i<pendingFiles.length;i++){ var p=pendingFiles[i]; if(p.cur==='USD') anyUSD=true;
+    h+='<div class="file-row"><span class="fic">📎</span>'
+      +'<span class="fname">'+esc(p.name)+' · '+p.txns.length+' txns</span>'
+      +'<button class="fchip'+(p.cur==='USD'?' usd':'')+'" type="button" onclick="flipCur('+i+')" title="Click to switch currency">'+p.cur+'</button>'
+      +'<button class="fx-x" type="button" onclick="removePending('+i+')" aria-label="Remove">×</button></div>';
+  }
+  L.innerHTML=h;
+  var row=document.getElementById('fxRateRow'); if(row) row.style.display=anyUSD?'block':'none';
+  var msg=document.getElementById('fxMsg'); if(msg) msg.style.display='none';
+}
+function flipCur(i){ if(pendingFiles[i]){ pendingFiles[i].cur = pendingFiles[i].cur==='CAD'?'USD':'CAD'; renderFileRows(); } }
+function removePending(i){ pendingFiles.splice(i,1); renderFileRows(); }
 function continueIntake(){
-  if(pendingFiles.length){ var f=pendingFiles.slice(); pendingFiles=[]; readFiles(f, function(list){ processTexts(list); }); }
-  closeAddAccounts();
+  if(pendingReads>0){ setTimeout(continueIntake,60); return; }   /* let in-flight reads finish */
+  if(!pendingFiles.length){ closeAddAccounts(); return; }
+  var txns=[], qu=[], seenRow={}, multi=pendingFiles.length>1;
+  pendingFiles.forEach(function(p){
+    p.txns.forEach(function(t){ t.cur=p.cur; t._fx=false;
+      if(multi){ var k=t.date+'|'+String(t.desc).toLowerCase()+'|'+Math.round(t.amt*100)+'|'+p.cur; if(seenRow[k]) return; seenRow[k]=true; }  /* same export dropped twice */
+      txns.push(t);
+    });
+    qu=qu.concat(p.quarantine);
+  });
+  var rateEl=document.getElementById('fxRate');
+  var rate=(rateEl && rateEl.value)? parseFloat(rateEl.value) : null;
+  var r=analyze(txns, rate);
+  if(r && r.needRate){   /* USD present, no rate to read and none entered — stop and ask, render nothing */
+    var row=document.getElementById('fxRateRow'); if(row) row.style.display='block';
+    var msg=document.getElementById('fxMsg'); if(msg){ msg.textContent="USD statements found but no conversion to read a rate from. Enter your bank's USD-to-CAD rate above, then run again."; msg.style.display='block'; }
+    return;
+  }
+  USER_RATE=rate;   /* commit the typed rate for THIS render only after a successful run (reanalyze + saveLastTxns use it) */
+  r.quarantined=qu; window.IS_DEMO=false;
+  saveLastTxns(txns, r);
+  updateYTD(r); render(r,false,txns);
+  pendingFiles=[]; renderFileRows(); closeAddAccounts();
+}
+function saveLastTxns(txns, r){
+  var userEntered = !!(r.fx && r.fx.rate_source==='the rate you entered');
+  var out=txns.map(function(t){ var o={date:t.date, desc:t.desc, amt:t.amt, acct:t.acct};
+    if((t.cur||'CAD')==='USD'){ o.cur='USD'; if(userEntered) o.fxr=USER_RATE; } return o; });
+  try{ localStorage.setItem('mh_last_txns', JSON.stringify(out)); }catch(e){}
 }
 
 /* ===== modal open/close ===== */
 function closeAddAccounts(){var m=document.getElementById('addAccountsModal');if(m)m.classList.add('hide');try{sessionStorage.setItem('mh_intake_hidden','1');}catch(e){}}
-function openAddAccounts(){var m=document.getElementById('addAccountsModal');if(m)m.classList.remove('hide');try{sessionStorage.removeItem('mh_intake_hidden');}catch(e){}}
+function openAddAccounts(){var m=document.getElementById('addAccountsModal');if(m)m.classList.remove('hide');
+  /* a fresh import session must never inherit the previous run's typed rate — the reference clears it by re-rendering the basket each cycle; our static modal has to reset it explicitly */
+  var fr=document.getElementById('fxRate'); if(fr) fr.value=''; renderFileRows();
+  try{sessionStorage.removeItem('mh_intake_hidden');}catch(e){}}
 (function(){
   var input=document.getElementById('moreFiles'), zone=document.getElementById('dropspot');
   if(input)input.addEventListener('change',function(e){if(e.target.files&&e.target.files.length)modalAddFiles(e.target.files);e.target.value='';});
@@ -1347,9 +1501,17 @@ function runOdometers(){
   var remembered=null;
   try{ var raw=localStorage.getItem('mh_last_txns'); if(raw){ var t=JSON.parse(raw); if(t&&t.length) remembered=t; } }catch(e){}
   if(remembered){
-    var r=analyze(remembered); r.quarantined=[]; window.IS_DEMO=false; updateYTD(r); render(r,false,remembered);
-    try{ sessionStorage.setItem('mh_intake_hidden','1'); }catch(e){}
-    var mm=document.getElementById('addAccountsModal'); if(mm) mm.classList.add('hide');
+    remembered.forEach(function(t){ t._fx=false; if(t.fxr && USER_RATE===null) USER_RATE=t.fxr; });
+    var r=analyze(remembered, USER_RATE);
+    if(r && r.needRate){   /* saved USD data with no readable rate — never render half-converted; ask for it */
+      loadSample();
+      var mm0=document.getElementById('addAccountsModal'); if(mm0) mm0.classList.remove('hide');
+      var msg0=document.getElementById('fxMsg'); if(msg0){ msg0.textContent="Your saved USD statements need a rate. Re-add your statements and enter your bank's USD-to-CAD rate."; msg0.style.display='block'; }
+    } else {
+      r.quarantined=[]; window.IS_DEMO=false; updateYTD(r); render(r,false,remembered);
+      try{ sessionStorage.setItem('mh_intake_hidden','1'); }catch(e){}
+      var mm=document.getElementById('addAccountsModal'); if(mm) mm.classList.add('hide');
+    }
   } else {
     loadSample();
     try{ if(sessionStorage.getItem('mh_intake_hidden')==='1'){ var m2=document.getElementById('addAccountsModal'); if(m2) m2.classList.add('hide'); } }catch(e){}
